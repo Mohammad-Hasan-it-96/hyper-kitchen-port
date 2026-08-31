@@ -943,6 +943,77 @@ def copy_partition_image(part, src_file, pack_cfg, lpc_args, counters):
     counters["pack_ok"] += 1
 
 
+# ---------------- super.img 参数校验 ----------------
+LP_BLOCK_SIZE = 4096
+LP_GEOMETRY_SIZE = 4096          # super 头尾各一份 geometry，共 2 份，各备份 1 次
+
+
+def _cfg_int(pack_cfg, key, fallback):
+    try:
+        return int(str(pack_cfg.get(key, fallback)).strip())
+    except (TypeError, ValueError):
+        err("{}={} is not a number, using {}".format(key, pack_cfg.get(key), fallback))
+        return fallback
+
+
+def align_metadata_size(pack_cfg):
+    # 必须是 4096 的整数倍；向上取整（元数据区只要够大且对齐即可）
+    raw = _cfg_int(pack_cfg, "metadata_size", 65536)
+    if raw <= 0:
+        err("metadata_size must be positive, using 65536")
+        return 65536
+    if raw % LP_BLOCK_SIZE == 0:
+        return raw
+    fixed = -(-raw // LP_BLOCK_SIZE) * LP_BLOCK_SIZE
+    err("metadata_size={} is not a multiple of {}; using {} instead".format(
+        raw, LP_BLOCK_SIZE, fixed))
+    err("  (the usual value is 65536; check [packing] metadata_size in config.ini)")
+    log_write("metadata_size {} -> {} (aligned to {})".format(raw, fixed, LP_BLOCK_SIZE))
+    return fixed
+
+
+def align_device_size(pack_cfg):
+    # 必须是 4096 的整数倍；向下取整（不能超过真实分区大小）
+    raw = _cfg_int(pack_cfg, "device_size", 6979321856)
+    if raw % LP_BLOCK_SIZE == 0:
+        return raw
+    fixed = (raw // LP_BLOCK_SIZE) * LP_BLOCK_SIZE
+    err("device_size={} is not a multiple of {}; using {} instead".format(
+        raw, LP_BLOCK_SIZE, fixed))
+    log_write("device_size {} -> {} (aligned to {})".format(raw, fixed, LP_BLOCK_SIZE))
+    return fixed
+
+
+def super_space_ok(lpc_args, device_size, meta_size, pack_cfg):
+    # 只在"明显放不下"时报错；临界情况仍交给 lpmake 判断
+    total = 0
+    parts = []
+    for a in lpc_args:
+        if a.startswith("--partition="):
+            bits = a.split("=", 1)[1].split(":")
+            if len(bits) >= 3 and bits[2].isdigit():
+                total += int(bits[2])
+                parts.append((bits[0], int(bits[2])))
+    if not parts:
+        return True
+    slots = _cfg_int(pack_cfg, "metadata_slots", 3)
+    overhead = LP_GEOMETRY_SIZE * 2 * 2 + meta_size * slots * 2
+    need = total + overhead
+    info("super space: partitions {} B + overhead {} B = {} B, device {} B".format(
+        total, overhead, need, device_size))
+    log_write("super space check: need={} device={}".format(need, device_size))
+    if need <= device_size:
+        info("super space: fits, {} B free".format(device_size - need))
+        return True
+    err("super.img does not fit: need {} bytes, device_size is {} bytes ({} short)".format(
+        need, device_size, need - device_size))
+    for name, size in sorted(parts, key=lambda x: -x[1]):
+        err("  {:<12} {} bytes".format(name, size))
+    err("Check [packing] device_size matches your phone's super partition.")
+    log_write("ERROR: super.img too big by {} bytes".format(need - device_size))
+    return False
+
+
 def create_super_img(pack_cfg, lpc_args, pack_ok):
     # lpmake 生成 super.img，返回 0=成功/跳过, 1=空间不足, 2=其他错误
     if pack_cfg.get("pack_super", "false").lower() != "true":
@@ -952,13 +1023,23 @@ def create_super_img(pack_cfg, lpc_args, pack_ok):
         log_write("WARNING: No partitions packed, super.img skipped")
         return 0
     info("Creating super.img...")
+
+    # lpmake 要求 metadata-size 和 device size 都是块大小(4096)的整数倍，
+    # 否则报 "Metadata max size must be a multiple of the block size, 4096"
+    meta_size = align_metadata_size(pack_cfg)
+    device_size = align_device_size(pack_cfg)
+
+    # 提前算一次空间，给出带数字的提示，而不是等 lpmake 抛出难懂的错误
+    if not super_space_ok(lpc_args, device_size, meta_size, pack_cfg):
+        return 1
+
     cmd = [
         str(LPM),
-        "--metadata-size", pack_cfg["metadata_size"],
+        "--metadata-size", str(meta_size),
         "--super-name", pack_cfg["super_name"],
         "--metadata-slots", pack_cfg["metadata_slots"],
-        "--device", "{}:{}".format(pack_cfg["super_name"], pack_cfg["device_size"]),
-        "--group", "{}:{}".format(pack_cfg["super_group"], pack_cfg["device_size"]),
+        "--device", "{}:{}".format(pack_cfg["super_name"], device_size),
+        "--group", "{}:{}".format(pack_cfg["super_group"], device_size),
     ]
     cmd += lpc_args
     if pack_cfg.get("virtual_ab", "true").lower() == "true":
