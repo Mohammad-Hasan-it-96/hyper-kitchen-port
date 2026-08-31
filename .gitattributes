@@ -1,0 +1,15 @@
+# config.ini is GBK-encoded with Chinese comments. Keep it byte-exact:
+# no line-ending conversion, no encoding guessing.
+config.ini -text
+
+# Bundled Windows tools. Never touch these.
+*.exe binary
+*.dll binary
+*.jar binary
+*.img binary
+
+# Everything else: normalise to LF in the repo.
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf

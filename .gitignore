@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------
+# XMAPort
+# ---------------------------------------------------------------
+# Working directory: downloaded ROMs, unpacked filesystems, packed
+# images and logs. Grows to many GB per run.
+workspace/
+
+# Incomplete bundled JRE: ships java.exe but no jvm.dll, so it can
+# never start. make_hyper.py falls back to JAVA_HOME / PATH instead.
+tools/jre/
