@@ -222,13 +222,64 @@ def run_tool(cmd):
         return 1
 
 
-def warn_if_non_ascii_path(path):
-    # 非 ASCII 路径本身可用，但部分外部工具对其支持不佳，提前提示便于排查
+def is_ascii(s):
     try:
-        str(path).encode("ascii")
+        str(s).encode("ascii")
+        return True
     except UnicodeEncodeError:
-        LOG_INFO("Note: path contains non-ASCII characters: " + str(path))
-        LOG_INFO("      If an external tool misbehaves, try a plain ASCII path.")
+        return False
+
+
+def short_path(path):
+    # Windows 8.3 短路径（如 "新建文件夹" -> "810A~1"）。不可用时返回 None。
+    # 只对已存在的路径有效。
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        GetShort = ctypes.windll.kernel32.GetShortPathNameW
+        GetShort.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        GetShort.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(4096)
+        n = GetShort(str(path), buf, 4096)
+        if n == 0 or n >= 4096:
+            return None
+        return buf.value
+    except Exception:
+        return None
+
+
+def java_arg_path(path):
+    # java.exe 用系统 ANSI 代码页解析命令行参数，非 ASCII 字符会变成 "?",
+    # 于是 java 报 "Unable to access jarfile"。这里把已存在的路径转成
+    # ASCII 安全形式；无法转换时返回 None，由调用方改用 ASCII 沙箱。
+    if is_ascii(path):
+        return str(path)
+    sp = short_path(path)
+    if sp and is_ascii(sp):
+        return sp
+    return None
+
+
+def ascii_sandbox_base():
+    # 找一个纯 ASCII 的临时目录根。TEMP 本身可能带非 ASCII（如中文用户名）。
+    candidates = []
+    try:
+        import tempfile
+        candidates.append(tempfile.gettempdir())
+    except Exception:
+        pass
+    sysdrive = os.environ.get("SystemDrive", "C:")
+    candidates.append(os.path.join(sysdrive + os.sep, "Windows", "Temp"))
+    candidates.append(sysdrive + os.sep)
+    for c in candidates:
+        if c and is_ascii(c) and os.path.isdir(c):
+            return c
+        sp = short_path(c) if c and os.path.isdir(c) else None
+        if sp and is_ascii(sp):
+            return sp
+    return None
 
 
 def java_works(java_path):
@@ -446,7 +497,6 @@ def clean_miui_booster(parent_dir):
         LOG_ERROR("Cannot run apktool: Java not found. Install Java or set JAVA_HOME.")
         return 1
     LOG_INFO("java:   " + java_path)
-    warn_if_non_ascii_path(apktool_path)
 
     temp_dir = os.path.join(parent_dir, "workspace", "temp_miubooster_" + int_to_str(os.getpid()))
     remove_dir_recursive(temp_dir)
@@ -457,13 +507,54 @@ def clean_miui_booster(parent_dir):
         os.remove(out_path)
     sys.stdout.flush()
 
+    # ---- 让所有传给 java 的路径都是 ASCII 安全的 ----
+    # java.exe 按系统 ANSI 代码页解析 argv，项目放在中文/阿拉伯语等目录下时
+    # 路径会被替换成 "?",导致 "Unable to access jarfile"。
+    sandbox = ""
+    j_java = java_arg_path(java_path) or java_path
+    j_apk = java_arg_path(apktool_path)
+    j_jar = java_arg_path(jar_path)
+    j_tmp = java_arg_path(temp_dir)
+
+    if not (j_apk and j_jar and j_tmp and is_ascii(j_java)):
+        # 8.3 短名不可用（很多非系统盘会关闭），改用 ASCII 沙箱：
+        # 把 jar 复制到纯 ASCII 目录里处理，完成后再拷回来
+        base = ascii_sandbox_base()
+        if not base:
+            LOG_ERROR("Project path has non-ASCII characters and no ASCII temp dir was found.")
+            LOG_ERROR("Move the project to a plain path such as D:\\hyper-kitchen-port.")
+            remove_dir_recursive(temp_dir)
+            return 1
+        sandbox = os.path.join(base, "xmaport_apktool_" + int_to_str(os.getpid()))
+        remove_dir_recursive(sandbox)
+        os.makedirs(sandbox, exist_ok=True)
+        LOG_INFO("Non-ASCII project path detected; using ASCII sandbox: " + sandbox)
+
+        j_apk = os.path.join(sandbox, "apktool.jar")
+        j_jar = os.path.join(sandbox, "MiuiBooster.jar")
+        j_tmp = os.path.join(sandbox, "decoded")
+        if not copy_file_overwrite(apktool_path, j_apk) or not copy_file_overwrite(jar_path, j_jar):
+            LOG_ERROR("Could not copy files into the ASCII sandbox.")
+            remove_dir_recursive(sandbox)
+            remove_dir_recursive(temp_dir)
+            return 1
+        if not is_ascii(j_java):
+            # 自带 jre 在非 ASCII 路径下也无法作为参数使用，改用系统 java
+            LOG_INFO("Bundled java path is not ASCII-safe, falling back to 'java' on PATH.")
+            j_java = "java"
+        # 后续的 smali 删除、产物读取都改在沙箱里进行
+        temp_dir = j_tmp
+        out_path = os.path.join(sandbox, "MiuiBooster.jar.cleaned")
+
     # Decode
-    cmd = [java_path, "-jar", apktool_path, "d", "-f", jar_path, "-o", temp_dir]
+    cmd = [j_java, "-jar", j_apk, "d", "-f", j_jar, "-o", j_tmp]
     LOG_INFO("Decoding: " + subprocess.list2cmdline(cmd))
     ret = run_tool(cmd)
     if ret != 0:
         LOG_ERROR("apktool decode failed with code: " + int_to_str(ret))
         remove_dir_recursive(temp_dir)
+        if sandbox:
+            remove_dir_recursive(sandbox)
         return 1
     LOG_INFO("apktool decode done.")
 
@@ -483,12 +574,20 @@ def clean_miui_booster(parent_dir):
         LOG_INFO("Removed " + int_to_str(len(to_delete)) + " DeviceLevelUtils/LiteUtils smali file(s).")
 
     # Rebuild
-    cmd = [java_path, "-jar", apktool_path, "b", temp_dir, "-o", out_path]
+    j_out = out_path if sandbox else (java_arg_path(temp_dir) and out_path)
+    if not sandbox:
+        # 输出文件还不存在，只能缩短父目录再拼回文件名
+        parent_of_out, out_name = os.path.split(out_path)
+        safe_parent = java_arg_path(parent_of_out)
+        j_out = os.path.join(safe_parent, out_name) if safe_parent else out_path
+    cmd = [j_java, "-jar", j_apk, "b", j_tmp, "-o", j_out]
     LOG_INFO("Rebuilding: " + subprocess.list2cmdline(cmd))
     ret = run_tool(cmd)
     if ret != 0:
         LOG_ERROR("apktool rebuild failed with code: " + int_to_str(ret))
         remove_dir_recursive(temp_dir)
+        if sandbox:
+            remove_dir_recursive(sandbox)
         return 1
     LOG_INFO("apktool rebuild done.")
 
@@ -496,7 +595,20 @@ def clean_miui_booster(parent_dir):
 
     if not os.path.exists(out_path):
         LOG_ERROR("apktool output not found: " + out_path)
+        if sandbox:
+            remove_dir_recursive(sandbox)
         return 1
+
+    if sandbox:
+        # 把沙箱里清理好的 jar 拷回项目路径（Python 处理 Unicode 路径没问题）
+        real_out = jar_path + ".cleaned"
+        if not copy_file_overwrite(out_path, real_out):
+            LOG_ERROR("Could not copy the cleaned jar out of the sandbox.")
+            remove_dir_recursive(sandbox)
+            return 1
+        out_path = real_out
+        remove_dir_recursive(sandbox)
+        LOG_INFO("ASCII sandbox cleaned up.")
 
     backup_path = jar_path + ".bak"
     if os.path.exists(backup_path):
