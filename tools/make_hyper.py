@@ -210,6 +210,27 @@ def copy_dir_recursive(src_dir, dest_dir):
 # Java lookup: look for a bundled JRE under tools/jre, otherwise fall back
 # to JAVA_HOME / system PATH / common install directories.
 # -----------------------------------------------------------------------------
+def run_tool(cmd):
+    # 以列表形式直接启动进程，绝不经过 cmd.exe。
+    # 经过 cmd.exe 时命令行会按系统 ANSI 代码页转换，路径里的非 ASCII 字符
+    # （阿拉伯语/中文等目录名）会被替换成 "?"，导致 java 找不到文件。
+    try:
+        return subprocess.call(cmd)
+    except OSError as e:
+        LOG_ERROR("Cannot start: " + str(cmd[0]))
+        LOG_ERROR("  " + str(e))
+        return 1
+
+
+def warn_if_non_ascii_path(path):
+    # 非 ASCII 路径本身可用，但部分外部工具对其支持不佳，提前提示便于排查
+    try:
+        str(path).encode("ascii")
+    except UnicodeEncodeError:
+        LOG_INFO("Note: path contains non-ASCII characters: " + str(path))
+        LOG_INFO("      If an external tool misbehaves, try a plain ASCII path.")
+
+
 def java_works(java_path):
     # java.exe 存在不代表能用：缺少 server/jvm.dll 的残缺 JRE 会启动即失败。
     # 只有真正跑通 "java -version" 才算可用。
@@ -425,6 +446,7 @@ def clean_miui_booster(parent_dir):
         LOG_ERROR("Cannot run apktool: Java not found. Install Java or set JAVA_HOME.")
         return 1
     LOG_INFO("java:   " + java_path)
+    warn_if_non_ascii_path(apktool_path)
 
     temp_dir = os.path.join(parent_dir, "workspace", "temp_miubooster_" + int_to_str(os.getpid()))
     remove_dir_recursive(temp_dir)
@@ -436,9 +458,9 @@ def clean_miui_booster(parent_dir):
     sys.stdout.flush()
 
     # Decode
-    cmd = 'cmd.exe /c ""{}" -jar "{}" d -f "{}" -o "{}""'.format(java_path, apktool_path, jar_path, temp_dir)
-    LOG_INFO("Decoding: " + cmd)
-    ret = subprocess.call(cmd, shell=True)
+    cmd = [java_path, "-jar", apktool_path, "d", "-f", jar_path, "-o", temp_dir]
+    LOG_INFO("Decoding: " + subprocess.list2cmdline(cmd))
+    ret = run_tool(cmd)
     if ret != 0:
         LOG_ERROR("apktool decode failed with code: " + int_to_str(ret))
         remove_dir_recursive(temp_dir)
@@ -461,9 +483,9 @@ def clean_miui_booster(parent_dir):
         LOG_INFO("Removed " + int_to_str(len(to_delete)) + " DeviceLevelUtils/LiteUtils smali file(s).")
 
     # Rebuild
-    cmd = 'cmd.exe /c ""{}" -jar "{}" b "{}" -o "{}""'.format(java_path, apktool_path, temp_dir, out_path)
-    LOG_INFO("Rebuilding: " + cmd)
-    ret = subprocess.call(cmd, shell=True)
+    cmd = [java_path, "-jar", apktool_path, "b", temp_dir, "-o", out_path]
+    LOG_INFO("Rebuilding: " + subprocess.list2cmdline(cmd))
+    ret = run_tool(cmd)
     if ret != 0:
         LOG_ERROR("apktool rebuild failed with code: " + int_to_str(ret))
         remove_dir_recursive(temp_dir)
@@ -772,6 +794,17 @@ def patch_build_prop(parent_dir):
         LOG_INFO("Target build.prop not found, no modification made, skipping: " + target_prop)
         return 0
 
+    # 重复运行时不能再追加一遍，否则 build.prop 会堆出重复属性
+    marker = "# XMAPort patched build prop"
+    try:
+        with open(target_prop, "r", encoding="utf-8", errors="ignore") as f:
+            if marker in f.read():
+                LOG_INFO("Props already patched (marker found), skipping.")
+                LOG_INFO("========================================")
+                return 0
+    except Exception:
+        pass
+
     need_newline = True
     try:
         with open(target_prop, "rb") as f:
@@ -790,6 +823,7 @@ def patch_build_prop(parent_dir):
         with open(target_prop, "a", encoding="utf-8", errors="ignore") as f:
             if need_newline:
                 f.write("\n")
+            f.write(marker + "\n")
             for line in patch_lines:
                 f.write(line + "\n")
 

@@ -3,6 +3,7 @@
 
 
 import argparse
+import json
 import os
 import platform
 import shutil
@@ -1006,6 +1007,122 @@ def create_super_img(pack_cfg, lpc_args, pack_ok):
 
 
 # ---------------- 一键移植流水线 ----------------
+# ---------------- 输入指纹：防止复用上一轮的中间产物 ----------------
+INPUTS_STAMP = WORKSPACE / "inputs.json"
+
+
+def input_id(local_path, url):
+    # 本地文件用 路径+大小+修改时间 标识；URL 直接用地址
+    if local_path:
+        p = Path(local_path)
+        try:
+            st = p.stat()
+            return "file:{}|{}|{}".format(p.resolve(), st.st_size, int(st.st_mtime))
+        except OSError:
+            return "file:{}".format(local_path)
+    return "url:{}".format(url or "")
+
+
+def current_inputs():
+    return {
+        "source": input_id(SRC_FILE, SRC_URL),
+        "target": input_id(TGT_FILE, TGT_URL),
+        "device": TARGET_DEVICE,
+    }
+
+
+def load_previous_inputs():
+    try:
+        return json.loads(INPUTS_STAMP.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def save_inputs(cur):
+    try:
+        INPUTS_STAMP.write_text(json.dumps(cur, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+    except Exception:
+        pass
+
+
+def dir_has_files(d):
+    try:
+        return any(p.is_file() for p in Path(d).rglob("*"))
+    except Exception:
+        return False
+
+
+def stale_dirs_for(changed):
+    # 输入变了，上一轮由它派生出来的目录就不能再用
+    dirs = []
+    if "source" in changed or "device" in changed:
+        dirs += [SRC_ROM, SRC_UNPACK, SRC_FS]
+    if "target" in changed or "device" in changed:
+        dirs += [TGT_ROM, TGT_UNPACK, TGT_FS]
+    dirs.append(PACK_OUT)
+    return [d for d in dirs if dir_has_files(d)]
+
+
+def wipe_dirs(dirs):
+    for d in dirs:
+        info("Removing stale data: {}".format(d))
+        log_write("Removing stale dir: {}".format(d))
+        shutil.rmtree(d, ignore_errors=True)
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
+def guard_stale_workspace(auto):
+    # Step 3/4 会跳过"已解压"的目录，若上一轮用的是别的 ROM，
+    # 就会把旧分区和新分区混在一起打包，产出一个错误的 ROM。
+    cur = current_inputs()
+    prev = load_previous_inputs()
+    if prev is None:
+        save_inputs(cur)
+        return True
+
+    changed = [k for k in ("source", "target", "device") if prev.get(k) != cur.get(k)]
+    if not changed:
+        save_inputs(cur)
+        return True
+
+    stale = stale_dirs_for(changed)
+    if not stale:
+        save_inputs(cur)
+        return True
+
+    print()
+    err("The workspace holds data from a different run.")
+    for key in changed:
+        err("  {} changed:".format(key))
+        err("    was: {}".format(prev.get(key, "")))
+        err("    now: {}".format(cur.get(key, "")))
+    err("Reusing it would mix old and new partitions into one ROM.")
+    for d in stale:
+        err("  stale: {}".format(d))
+    log_write("Stale workspace detected, changed: {}".format(", ".join(changed)))
+
+    if auto:
+        info("Auto mode: cleaning stale data before continuing")
+        wipe_dirs(stale)
+        save_inputs(cur)
+        return True
+
+    answer = prompt("  {}Delete this stale data and start fresh? (Y/N): {}".format(Y, N))
+    if answer.strip().lower() == "y":
+        wipe_dirs(stale)
+        save_inputs(cur)
+        return True
+
+    err("Keeping stale data. The result may be wrong. Continuing as you asked.")
+    log_write("WARNING: user kept stale workspace data")
+    save_inputs(cur)
+    return True
+
+
 def required_tool_names(pack_cfg, need_download):
     # 本次运行真正会用到的 .exe。被拦截的工具若用不上，不应阻断流程
     names = ["7z.exe", "payload-dumper-go.exe", "simg2img.exe", "extract.erofs.exe"]
@@ -1132,6 +1249,9 @@ def one_click_port(auto=False, local=False):
             raise ReturnToMenu()
     else:
         info("Auto mode: skipping confirmation, proceeding...")
+
+    # 输入是否和上一轮一致？不一致就清掉旧的中间产物
+    guard_stale_workspace(auto)
 
     # ---------------- Step 1: 获取 ROM（下载或使用本地文件） ----------------
     info("=== Step 1/7: Acquire ROM ===")

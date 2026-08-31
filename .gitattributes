@@ -1,3 +1,11 @@
+# Git applies the LAST matching rule, so the catch-all goes first and the
+# specific rules below override it.
+* text=auto
+
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+
 # config.ini is GBK-encoded with Chinese comments. Keep it byte-exact:
 # no line-ending conversion, no encoding guessing.
 config.ini -text
@@ -7,9 +15,3 @@ config.ini -text
 *.dll binary
 *.jar binary
 *.img binary
-
-# Everything else: normalise to LF in the repo.
-* text=auto
-*.py text eol=lf
-*.sh text eol=lf
-*.md text eol=lf
